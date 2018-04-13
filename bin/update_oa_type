@@ -1,0 +1,549 @@
+#!/usr/bin/perl -w -I/usr/local/eprints/perl_lib
+
+###############################################################################
+#
+# Update OA Type
+#
+# This script tries to determine for a set of articles their OA type and APCs.
+#
+###############################################################################
+#
+#  Copyright 2018 University of Zurich. All Rights Reserved.
+#  
+#  The plug-ins are free software; you can redistribute them and/or modify
+#  them under the terms of the GNU General Public License as published by
+#  the Free Software Foundation; either version 2 of the License, or
+#  (at your option) any later version.
+#  
+#  The plug-ins are distributed in the hope that they will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU General Public License for more details.
+#  
+#  You should have received a copy of the GNU General Public License
+#  along with EPrints 3; if not, write to the Free Software
+#  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+#
+######################################################################
+
+
+=pod
+
+=head1 NAME
+
+B<update_oa_type> - Determine the OA type and the APCs for a set of
+publications.
+
+=head1 SYNOPSIS
+
+B<update_oa_type> I<repository_id> [B<options>] [I<eprint_id> I<eprint_id> ...]
+
+=head1 DESCRIPTION
+
+This command tries to determine the OA type and the APCs for a set of
+publications. If nothing is specified, it takes all publications and tries to 
+assign gold, green or closed OA type from information that is being retrieved
+from various sources, notably Unpaywall. The sources  and their priority 
+can be configured as plug-ins of the OpenAccess plug-in package.
+A publication year can be  specified to limit the number of publications. 
+The output is a CSV list of publications including the eprint URL, document type, 
+full text flag, access rights, journal title, publisher, DOI or URL, APC 
+currency, fee, and year, exchange rate, APC fee in CHF, OA status, DOAJ flag, 
+source of OA status, DRIVER version by Unpaywall, tentative OA status, remark, 
+and an update APC flag.
+
+=head1 ARGUMENTS
+
+=over 8
+
+=item [I<eprint_id> I<eprint_id> ...]
+
+A list of eprint_ids used for synchronizing. If not specified, the complete 
+dataset or a set by publication year will be used.
+
+=back
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<--pubyear> I<n>
+
+Specify a publication year.
+
+=item B<--new-only>
+
+Only processes the eprint items that have not yet a OA type assigned.
+
+=item B<--report-only>
+
+Only creates a report without saving the results to the repository.
+
+=item B<--save-guess>
+
+Saves the guessed OA type in the eprint record as well.
+
+=item B<--dir DIRECTORY>
+
+Sets the directory for storing the CSV report (report.csv). If not specified,
+it will be set to {eprints_root}/var .
+
+=item B<--json-only>
+
+Only retrieves and saves the Unpaywall API JSON, but does not parse or process 
+it further. Requires B<--json-dir>.
+
+=item B<--json-dir DIRECTORY>
+
+Stores JSON outputs in DIRECTORY. The filename for each requested eprint is 
+unpaywall_{eprintid}.json
+
+=item B<--help>
+
+Print a brief help message and exit.
+
+=item B<--man>
+
+Print the full manual page and then exit.
+
+=item B<--quiet>
+
+Be vewwy vewwy quiet. This option will supress all output unless an error occurs.
+
+=item B<--verbose>
+
+Explain in detail what is going on.
+May be repeated for greater effect.
+
+=back
+
+=cut
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use Text::CSV;
+
+use EPrints;
+
+#
+# Global variables
+#
+my $report = {};
+
+#
+# Set default parameters
+#
+my $crawl_timeout = 60;
+my $crawl_retry = 3;
+my $crawl_delay = 10;
+
+#
+# Parameters for command line options
+#
+my $pubyear = 0;
+my $newonly = 0;
+my $report_only = '';
+my $report_dir = '';
+my $json_only = 0;
+my $json_directory = undef;
+my $save_guess = 0;
+my $help = 0;
+my $man = 0;
+my $verbose = 0;
+my $quiet = 0;
+
+#
+# Parse the command line options
+#
+Getopt::Long::Configure("permute");
+GetOptions(
+	'pubyear=s' => \$pubyear,
+	'new-only' => \$newonly,
+	'report-only' => \$report_only,
+	'save-guess' => \$save_guess,
+	'dir=s' => \$report_dir,
+	'json-only' => \$json_only,
+	'json-dir=s' => \$json_directory,
+	'help|?' => \$help,
+	'man' => \$man,
+	'verbose+' => \$verbose,
+	'quiet' => \$quiet,
+) || pod2usage( 2 );
+
+#
+# Print out help screens, if desired
+#
+pod2usage( 1 ) if $help;
+pod2usage( -exitstatus => 0, -verbose => 2 ) if $man;
+pod2usage( 2 ) if( scalar @ARGV < 1 ); 
+
+#
+# Configure verbosity
+#
+my $noise = 1;
+$noise = 0 if( $quiet );
+$noise = 1 + $verbose if( $verbose );
+
+#
+# Get an EPrints session and the live dataset 
+#
+
+my $repoid = $ARGV[0];
+
+my $session = EPrints::Session->new( 1, $repoid, $noise );
+if ( !defined $session )
+{
+	print STDERR "Failed to load repository: $repoid\n";
+	exit 1;
+}
+
+
+my $dataset = $session->get_repository->get_dataset( "archive" );
+if ( !defined $dataset )
+{
+	print STDERR "Could not access the $repoid archive dataset!\n";
+	$session->terminate;
+	exit 1;
+}
+
+if ($report_dir eq '')
+{
+	$report_dir = $session->get_repository->get_conf( "base_path" ) . '/var';
+}
+else
+{
+	if (! -d $report_dir )
+	{
+		print STDERR "Directory $report_dir does not exist!\n";
+		$session->terminate;
+		exit 1;
+	} 
+}
+
+if ( $json_only )
+{
+	if ( !defined $json_directory ) 
+	{
+		print "--json-dir must be specified if --json-only is used\n";
+		exit 1;
+	}
+		
+	if ( ! -d $json_directory )
+	{
+	
+		print "Directory $json_directory does not exist\n";
+		exit 1;
+	}
+}
+
+#
+# Create a plug-in 
+#
+my $plugin;
+$plugin = $session->plugin( 'OpenAccess' );
+
+if ( !defined $plugin )
+{
+	$session->terminate;
+	exit 1;
+}
+
+#
+# Set the plug-in parameters
+#
+$plugin->{param}->{crawl_timeout} = $crawl_timeout;
+$plugin->{param}->{crawl_retry} = $crawl_retry;
+$plugin->{param}->{crawl_delay} = $crawl_delay;
+$plugin->{param}->{json_only} = $json_only;
+$plugin->{param}->{json_directory} = $json_directory;
+$plugin->{param}->{verbose} = $verbose;
+$plugin->{param}->{noise} = $noise;
+$plugin->{param}->{pubyear} = $pubyear;
+
+#
+# Prepare the script parameters
+#
+my $param;
+
+$param->{verbose} = $verbose;
+$param->{report} = $report;
+$param->{report_dir} = $report_dir;
+$param->{report_only} = $report_only;
+$param->{save_guess} = $save_guess;
+$param->{pubyear} = $pubyear;
+$param->{plugin} = $plugin;
+
+#
+# Find the publications
+#
+my $publications;
+
+if ( scalar(@ARGV) > 1 )
+{
+	# for specific eprintids in the live archive
+	my $plist = "";
+	
+	for (my $i = 1; $i < scalar(@ARGV); $i++)
+	{
+		$plist = $plist . $ARGV[$i] . " ";
+	}
+
+	$plist = substr($plist,0,-1) if (length($plist) > 0);
+	
+	my $epexp = EPrints::Search->new(
+   		session => $session,
+   		dataset => $dataset,
+   		order => "eprintid",
+   	);
+   	
+   	$epexp->add_field(
+   		$dataset->get_field("eprintid"),
+   		$plist,
+   		"EQ",
+   		"ANY",
+   	);
+   	
+   	$publications = $epexp->perform_search;
+}
+else
+{
+	$publications = find_publications( $session, $dataset, $pubyear, $newonly );
+}
+
+my $count = $publications->count();
+print STDOUT "Processing $count publications\n" if $verbose;
+
+$publications->map( \&process_record, $param );
+
+convert_apc_currencies( $session, $param );
+print_report( $param );
+
+$session->terminate;
+
+exit;
+
+#
+# Find all publications in ZORA
+#
+sub find_publications
+{
+	my ( $session, $dataset, $year, $new ) = @_;
+	
+	my $eplist;
+	
+   	if ( $year )
+   	{
+		my $search_expression = EPrints::Search->new(
+			session => $session,
+			dataset => $dataset
+	   	);
+   		
+   		$search_expression->add_field(
+   			fields => [
+				$dataset->get_field( "date" ),
+			],
+			value => $year,
+			match => "EQ",
+			merge => "ALL"
+   		);
+
+   		$eplist = $search_expression->perform_search;
+   	}
+   	if ( $new )
+   	{
+   		my $search_expression = EPrints::Search->new(
+			session => $session,
+			dataset => $dataset
+	   	);
+	   	
+	   	$search_expression->add_field(
+   			fields => [
+				$dataset->get_field( "oa_status" ),
+			],
+			value => "",
+			match => "EX",
+			merge => "ALL"
+		);
+		
+		$eplist = $search_expression->perform_search;
+   	}
+   	else
+   	{
+   		$eplist = $dataset->search;
+   	}
+   	
+   	return $eplist;
+}
+
+#
+# Process the publications
+#
+sub process_record
+{
+	my ($session, $dataset, $eprint, $param) = @_;
+	
+	my $plugin = $param->{plugin};
+	
+	my $report = $param->{report};
+	my $report_only = $param->{report_only};
+	my $save_guess = $param->{save_guess};
+	
+	$plugin->{eprint} = $eprint;
+	
+	my $oa_data = $plugin->get_oa_type();
+	
+	my $eprintid = $eprint->get_value( "eprintid" );
+	
+	
+	foreach my $oa_key (keys %$oa_data)
+	{
+		$report->{$eprintid}->{$oa_key} = $oa_data->{$oa_key}->{value};
+	}
+	
+	# Source must be assigned separately 
+	$report->{$eprintid}->{source} = $oa_data->{oa_type}->{source};
+	
+;
+	
+	if ( !$report_only )
+	{
+		# Update the eprint record
+		my $oa_type = $oa_data->{oa_type}->{value};
+		my $is_doaj = $oa_data->{is_doaj}->{value};
+	
+		$oa_type = $oa_data->{tentative_oa_type}->{value} if $save_guess;
+		$plugin->update_oa_data( $oa_type, $is_doaj );
+	}
+	
+	return;
+}
+
+#
+# Convert Currency to CHF
+#
+sub convert_apc_currencies
+{
+	my ($session, $param) = @_;
+	
+	my $report = $param->{report};
+	my $pubyear = $param->{pubyear};
+	
+	my $exchange_rates = $session->config( "exchange_rates" );
+	
+	foreach my $recordid (keys %$report)
+	{
+		my $exchange_rate = 1.0;
+		my $currency = $report->{$recordid}->{apc_currency};
+		
+		
+		if (defined $currency && defined $exchange_rates->{$pubyear}->{$currency} )
+		{
+			$exchange_rate = $exchange_rates->{$pubyear}->{$currency};
+		}
+		
+		$report->{$recordid}->{exchange_rate} = $exchange_rate;
+		$report->{$recordid}->{apc_chf} = $report->{$recordid}->{apc_fee} * $exchange_rate;
+	}
+	
+	return;
+}
+
+#
+# Print everything to a CSV report.
+#
+sub print_report
+{
+	my ( $param ) = @_;
+	
+	my $verbose = $param->{verbose};
+	my $report_dir = $param->{report_dir};
+	my $report = $param->{report};
+	
+	my $filename = $report_dir . '/report.csv';
+	open my $csvout, ">:encoding(utf8)", $filename or die "Cannot open > $filename\n";
+	
+	print STDOUT "Saving CSV report to $filename\n" if $verbose;
+	
+	my $csv = Text::CSV->new({ always_quote => 1 });
+	$csv->eol("\n");
+	
+	# print headers
+	my @headers = ( "Repository URL", "Type", "Full Text", "Access Rights", "Journal", "Publisher", "URL", 
+		"APC Currency", "APC Fee", "APC Date", "Exchange rate", "APC Fee CHF",
+		"published_version", "Content", "OA Type", "DOAJ", "Source", "unpaywall DRIVER Version", 
+		"Tentative OA Status", "Remark", "Update APC?"
+	 );
+	
+	$csv->print( $csvout, \@headers );
+	$csv->print( *STDOUT, \@headers ) if $verbose;
+	
+	# print results
+	foreach my $recordid (sort {$a <=> $b} keys %$report )
+	{
+		my @csv_values = ();
+	
+		push @csv_values, ( 
+			$report->{$recordid}->{eprint_url}, 
+			$report->{$recordid}->{type},
+			$report->{$recordid}->{has_full_text},
+			$report->{$recordid}->{access_rights},
+			$report->{$recordid}->{journal},
+			$report->{$recordid}->{publisher},
+			$report->{$recordid}->{url},
+			$report->{$recordid}->{apc_currency},
+			$report->{$recordid}->{apc_fee},
+			$report->{$recordid}->{apc_year},
+			$report->{$recordid}->{exchange_rate},
+			$report->{$recordid}->{apc_chf},
+			$report->{$recordid}->{published_version},
+			$report->{$recordid}->{content},
+			$report->{$recordid}->{oa_type},
+			$report->{$recordid}->{is_doaj},
+			$report->{$recordid}->{source},
+			$report->{$recordid}->{driver_version},
+			$report->{$recordid}->{tentative_oa_status},
+			$report->{$recordid}->{remark},
+			$report->{$recordid}->{update_apc},
+		);
+			
+		$csv->print( $csvout, \@csv_values );
+		$csv->print( *STDOUT, \@csv_values ) if $verbose;
+	}
+	
+	close $csvout;
+	return;
+}
+
+=head1 AUTHOR
+
+Martin Brändle <martin.braendle@id.uzh.ch>, Zentrale Informatik, University of Zurich
+
+=head1 COPYRIGHT
+
+=for COPYRIGHT BEGIN
+
+Copyright 2018- University of Zurich.
+
+=for COPYRIGHT END
+
+=for LICENSE BEGIN
+
+This file is part of JDB/ZORA based on EPrints L<http://www.eprints.org/>.
+
+EPrints is free software: you can redistribute it and/or modify it
+under the terms of the GNU Lesser General Public License as published
+by the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+EPrints is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public
+License for more details.
+
+You should have received a copy of the GNU Lesser General Public
+License along with EPrints.  If not, see L<http://www.gnu.org/licenses/>.
+
+=for LICENSE END
