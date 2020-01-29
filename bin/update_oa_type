@@ -352,7 +352,7 @@ sub find_publications
 
    		$eplist = $search_expression->perform_search;
    	}
-   	if ( $new )
+   	elsif ( $new )
    	{
    		my $search_expression = EPrints::Search->new(
 			session => $session,
